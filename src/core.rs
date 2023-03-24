@@ -1,4 +1,4 @@
-use std::{rc::Rc, sync::Mutex};
+use std::hash::Hash;
 
 use crate::messages::{MessageRequest, MessageResponse};
 
@@ -7,7 +7,6 @@ pub type LogIndex = usize;
 pub type Term = u32;
 pub type ServerId = u32;
 pub type Command = u32;
-pub type Servers = Vec<Rc<Mutex<Server>>>;
 
 #[derive(Debug)]
 pub struct LogEntry {
@@ -59,7 +58,9 @@ struct VolatileLeaderState {
     match_index: Vec<LogIndex>,
 }
 
+#[derive(Clone, Copy)]
 pub enum PrepareMessageType {
+    EMPTY,
     APPEND_ENTRIES,
     REQUEST_VOTE,
 }
@@ -70,20 +71,34 @@ pub struct Server {
     persistent_state: PersistentState,
     volatile_state: VolatileState,
     volatile_leader_state: Option<VolatileLeaderState>,
-    servers: Servers,
+    servers: u32,
+}
+
+impl Eq for Server {}
+
+impl PartialEq for Server {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Hash for Server {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state)
+    }
 }
 
 impl Server {
-    pub fn init(id: ServerId) -> Rc<Mutex<Server>> {
-        Rc::new(Mutex::new(Server {
+    pub fn init(id: ServerId) -> Server {
+        Server {
             id,
             // By default we want all nodes to start as followers.
             role: ServerRole::FOLLOWER,
             persistent_state: PersistentState::default(),
             volatile_state: VolatileState::default(),
             volatile_leader_state: None,
-            servers: vec![],
-        }))
+            servers: 0,
+        }
     }
 
     pub fn add_command(&mut self, command: Command) {
@@ -96,6 +111,7 @@ impl Server {
 
     pub fn prepare_message_request(&self, message_type: PrepareMessageType) -> MessageRequest {
         match message_type {
+            PrepareMessageType::EMPTY => MessageRequest::Empty,
             PrepareMessageType::APPEND_ENTRIES => todo!(),
             PrepareMessageType::REQUEST_VOTE => MessageRequest::RequestVote {
                 term: self.persistent_state.current_term,
@@ -240,7 +256,7 @@ impl Server {
 
                     // In case we have received a role from the majority, including ourselves, we want to switch to leaders.
                     if let Some(voted_by) = self.persistent_state.voted_by {
-                        if voted_by > self.servers.len() / 2 {
+                        if voted_by > (self.servers / 2) as usize {
                             self.change_role(ServerRole::LEADER);
                         }
                     }
@@ -260,51 +276,20 @@ impl Server {
         self.role = new_role
     }
 
-    pub fn broadcast(&mut self, message: MessageRequest) {
-        self.servers.iter().for_each(|server| {
-            server
-                .lock()
-                .unwrap()
-                .handle_message_request(self.id, message.clone());
-        });
-    }
-
-    pub fn bind(&mut self, server: Rc<Mutex<Server>>) {
-        self.servers.push(server)
+    pub fn bind(&mut self, n: u32) {
+        self.servers += n
     }
 }
 
-pub struct Client {
-    servers: Vec<Server>,
-}
+// pub struct Client {
+//     servers: Vec<Server>,
+// }
 
-impl Client {
-    pub fn init() -> Client {
-        Client { servers: vec![] }
-    }
-}
-
-pub fn bind_servers(servers: Servers) {
-    let outer_servers: Servers = servers.iter().cloned().collect();
-    let inner_servers: Servers = servers.iter().cloned().collect();
-
-    outer_servers.into_iter().for_each(|outer_server| {
-        inner_servers.iter().for_each(|inner_server| {
-            let outer_id = outer_server.lock().unwrap().id;
-            let inner_id = inner_server.lock().unwrap().id;
-
-            if outer_id != inner_id {
-                outer_server.lock().unwrap().bind(inner_server.clone());
-            }
-        });
-    });
-}
-
-pub fn broadcast(servers: Servers) {
-    servers.iter().for_each(|server| {
-        server.lock().unwrap().broadcast(MessageRequest::Empty);
-    })
-}
+// impl Client {
+//     pub fn init() -> Client {
+//         Client { servers: vec![] }
+//     }
+// }
 
 #[cfg(test)]
 mod tests {}
