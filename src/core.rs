@@ -1,6 +1,14 @@
-use std::hash::Hash;
+use std::{
+    hash::Hash,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use crate::messages::{MessageRequest, MessageResponse};
+use crate::{
+    messages::{MessageRequest, MessageResponse},
+    timer::{TimerAction, TimerId, TimersManager},
+    transport::TransportInstance,
+};
 
 pub type Log<T> = Vec<T>;
 pub type LogIndex = usize;
@@ -14,8 +22,9 @@ pub struct LogEntry {
     command: Command,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum ServerRole {
+    NONE,
     FOLLOWER,
     CANDIDATE,
     LEADER,
@@ -65,40 +74,50 @@ pub enum PrepareMessageType {
     REQUEST_VOTE,
 }
 
-pub struct Server {
+pub type RaftServerInstance = Arc<Mutex<RaftServer>>;
+
+pub struct RaftServer {
+    // Basic base information.
     pub id: ServerId,
     pub role: ServerRole,
+    // Basic state.
     persistent_state: PersistentState,
     volatile_state: VolatileState,
     volatile_leader_state: Option<VolatileLeaderState>,
     servers: u32,
+    // Extra information.
+    transport: Option<TransportInstance>,
+    timers_manager: Option<TimersManager>,
+    election_timer_id: Option<TimerId>,
 }
 
-impl Eq for Server {}
-
-impl PartialEq for Server {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
-
-impl Hash for Server {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.id.hash(state)
-    }
-}
-
-impl Server {
-    pub fn init(id: ServerId) -> Server {
-        Server {
+impl RaftServer {
+    pub fn new(id: ServerId) -> RaftServer {
+        RaftServer {
             id,
-            // By default we want all nodes to start as followers.
-            role: ServerRole::FOLLOWER,
+            // By default the server has no role assigned.
+            role: ServerRole::NONE,
             persistent_state: PersistentState::default(),
             volatile_state: VolatileState::default(),
             volatile_leader_state: None,
             servers: 0,
+            transport: None,
+            timers_manager: None,
+            election_timer_id: None,
         }
+    }
+
+    pub fn new_instance(id: ServerId) -> RaftServerInstance {
+        Arc::new(Mutex::new(Self::new(id)))
+    }
+
+    pub fn register_dependencies(
+        &mut self,
+        transport: TransportInstance,
+        timers_manager: TimersManager,
+    ) {
+        self.transport = Some(transport);
+        self.timers_manager = Some(timers_manager);
     }
 
     pub fn add_command(&mut self, command: Command) {
@@ -132,7 +151,7 @@ impl Server {
         message: MessageRequest,
     ) -> MessageResponse {
         println!(
-            "Server {} received message {:?} from {}",
+            "Server {} received message request {:?} from {}",
             self.id, message, sender_id
         );
 
@@ -140,6 +159,7 @@ impl Server {
             ServerRole::FOLLOWER => self.handle_message_request_as_follower(sender_id, message),
             ServerRole::CANDIDATE => self.handle_message_request_as_candidate(sender_id, message),
             ServerRole::LEADER => self.handle_message_request_as_leader(sender_id, message),
+            ServerRole::NONE => MessageResponse::Empty,
         };
 
         if self.volatile_state.commit_index > self.volatile_state.last_applied {
@@ -247,6 +267,11 @@ impl Server {
     }
 
     pub fn handle_message_response(&mut self, sender_id: ServerId, message: MessageResponse) {
+        println!(
+            "Server {} received message response {:?} from {}",
+            self.id, message, sender_id
+        );
+
         match message {
             MessageResponse::AppendEntries { term, success } => todo!(),
             MessageResponse::RequestVote { term, vote_granted } => {
@@ -273,7 +298,38 @@ impl Server {
             "Changing role of server {:?} from {:?} to {:?}",
             self.id, self.role, new_role
         );
-        self.role = new_role
+
+        self.on_change_role(Some(self.role), new_role);
+        self.role = new_role;
+    }
+
+    fn on_change_role(&mut self, prev_role: Option<ServerRole>, new_role: ServerRole) {
+        // We must make sure that any call to transport or timers manager is non-blocking, otherwise we will deadlock, since those
+        // services will want to get a lock on this instance of the server.
+        match new_role {
+            ServerRole::FOLLOWER => {
+                self.election_timer_id = Some(
+                    // TODO: check properly that the timers manager is added.
+                    self.timers_manager
+                        .as_mut()
+                        .unwrap()
+                        .register(Duration::from_secs(2), TimerAction::SWITCH_TO_CANDIDATE),
+                );
+            }
+            ServerRole::CANDIDATE => {
+                if let Some(timer_id) = self.election_timer_id {
+                    self.timers_manager.as_mut().unwrap().stop(timer_id);
+                }
+
+                self.transport
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .broadcast(self.id, PrepareMessageType::REQUEST_VOTE)
+            }
+            _ => {}
+        }
     }
 
     pub fn bind(&mut self, n: u32) {
@@ -281,15 +337,22 @@ impl Server {
     }
 }
 
-// pub struct Client {
-//     servers: Vec<Server>,
-// }
+impl Eq for RaftServer {}
 
-// impl Client {
-//     pub fn init() -> Client {
-//         Client { servers: vec![] }
-//     }
-// }
+impl PartialEq for RaftServer {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Hash for RaftServer {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state)
+    }
+}
+
+// TODO: implement a Raft client which sends commands to the leader, either by discovery or just by always knowing who is the leader.
+struct RaftClient {}
 
 #[cfg(test)]
 mod tests {}

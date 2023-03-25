@@ -1,7 +1,7 @@
-use crate::core::{Log, LogIndex, Server, ServerId, Term};
+use crate::core::{Log, LogIndex, RaftServer, ServerId, Term};
 
 pub trait Message {
-    fn handle(handler: &mut Server);
+    fn handle(handler: &mut RaftServer);
 }
 
 #[derive(Debug, Clone)]
