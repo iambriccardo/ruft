@@ -47,24 +47,29 @@ impl TimersManager {
 
         let (tx, rx): (mpsc::Sender<()>, mpsc::Receiver<()>) = mpsc::channel();
         let handle = thread::spawn(move || loop {
+            // We check if we were told to stop.
             if rx.try_recv().is_ok() {
                 break;
             }
 
             thread::sleep(sleep);
+
+            // We check if we were told to stop.
+            if rx.try_recv().is_ok() {
+                break;
+            }
+
             match timer_action {
                 TimerAction::SWITCH_TO_CANDIDATE => server
                     .lock()
                     .unwrap()
                     .change_role(crate::core::ServerRole::CANDIDATE),
                 TimerAction::SEND_EMPTY_APPEND_ENTRIES => {
-                    println!("REGISTER");
                     let server_id = server.lock().unwrap().id;
-                    println!("LOCK");
                     transport
                         .lock()
                         .unwrap()
-                        .broadcast(server_id, PrepareMessageType::EMPTY)
+                        .broadcast(server_id, PrepareMessageType::EMPTY_APPEND_ENTRIES)
                 }
             }
         });
