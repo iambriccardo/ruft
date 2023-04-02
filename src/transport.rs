@@ -46,26 +46,44 @@ impl Transport {
     }
 
     pub fn broadcast(&mut self, sender_id: ServerId, message_type: PrepareMessageType) {
+        let mut message_type = message_type;
         let servers = self.servers.clone();
         thread::spawn(move || {
             let servers = servers.lock().unwrap();
             if let Some(sender_server) = servers.get(&sender_id) {
                 servers.iter().for_each(|(receiver_id, receiver_server)| {
                     if *receiver_id != sender_id {
-                        let message_request = sender_server
-                            .lock()
-                            .unwrap()
-                            .prepare_message_request(message_type, *receiver_id);
+                        loop {
+                            let message_request = sender_server
+                                .lock()
+                                .unwrap()
+                                .prepare_message_request(message_type, *receiver_id);
 
-                        let message_response = receiver_server
-                            .lock()
-                            .unwrap()
-                            .handle_message_request(sender_id, message_request);
+                            let message_response = receiver_server
+                                .lock()
+                                .unwrap()
+                                .handle_message_request(sender_id, message_request.clone());
 
-                        sender_server
-                            .lock()
-                            .unwrap()
-                            .handle_message_response(*receiver_id, message_response)
+                            let handled_with_success =
+                                sender_server.lock().unwrap().handle_message_response(
+                                    *receiver_id,
+                                    message_request,
+                                    message_response.clone(),
+                                );
+
+                            // Because we want to keep the communication logic abstracted away from the RaftServer, we want to implement
+                            // a retrying mechanism. This implementation is very simplistic and should require a better API which should leverage
+                            // retriable objects that change their state after each retry.
+                            if handled_with_success {
+                                break;
+                            } else {
+                                println!(
+                                    "The message response {:?} is not successful, retrying...",
+                                    message_response
+                                );
+                                message_type = message_type.retry()
+                            }
+                        }
                     }
                 })
             }

@@ -121,8 +121,21 @@ impl VolatileLeaderState {
 pub enum PrepareMessageType {
     EMPTY,
     EMPTY_APPEND_ENTRIES,
-    APPEND_ENTRIES,
+    APPEND_ENTRIES { decrement: usize },
     REQUEST_VOTE,
+}
+
+impl PrepareMessageType {
+    pub fn retry(&self) -> Self {
+        match self {
+            PrepareMessageType::APPEND_ENTRIES { decrement } => {
+                PrepareMessageType::APPEND_ENTRIES {
+                    decrement: decrement + 1,
+                }
+            }
+            _ => self.clone(),
+        }
+    }
 }
 
 pub type RaftServerInstance = Arc<Mutex<RaftServer>>;
@@ -196,7 +209,7 @@ impl RaftServer {
                 entries: vec![],
                 leader_commit: self.volatile_state.commit_index,
             },
-            PrepareMessageType::APPEND_ENTRIES => {
+            PrepareMessageType::APPEND_ENTRIES { decrement } => {
                 if let ServerRole::LEADER = self.role {
                     let last_log_index = self.persistent_state.last_log_index();
                     let next_index = self
@@ -207,7 +220,7 @@ impl RaftServer {
 
                     if let (Some(last_log_index), Some(next_index)) = (last_log_index, next_index) {
                         // We want to check if we have to send new log entries to receiver.
-                        if last_log_index >= next_index {
+                        if last_log_index >= next_index - decrement {
                             let entries = self.persistent_state.log_entries_from(next_index);
                             return MessageRequest::AppendEntries {
                                 term: self.persistent_state.current_term,
@@ -254,35 +267,20 @@ impl RaftServer {
                 prev_log_term,
                 entries,
                 leader_commit,
-            } => match self.role {
-                ServerRole::CANDIDATE => {
-                    self.change_role(ServerRole::FOLLOWER);
-                    MessageResponse::Empty
-                }
-                ServerRole::FOLLOWER => {
-                    self.clear_active_timers();
-                    self.election_tid = Some(
-                        self.timers_manager
-                            .as_mut()
-                            .unwrap()
-                            .register(Duration::from_secs(2), TimerAction::SWITCH_TO_CANDIDATE),
-                    );
-                    MessageResponse::Empty
-                }
-                _ => MessageResponse::Empty,
-            },
+            } => self.handle_append_entries_req(
+                term,
+                leader_id,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+            ),
             MessageRequest::RequestVote {
                 term,
                 candidate_id,
                 last_log_index,
                 last_log_term,
-            } => match self.role {
-                // Only a followe and a candidate can vote.
-                ServerRole::FOLLOWER | ServerRole::CANDIDATE => {
-                    self.handle_request_vote_req(term, candidate_id, last_log_index, last_log_term)
-                }
-                _ => MessageResponse::Empty,
-            },
+            } => self.handle_request_vote_req(term, candidate_id, last_log_index, last_log_term),
             _ => MessageResponse::Empty,
         };
 
@@ -304,68 +302,121 @@ impl RaftServer {
         last_log_index: Option<LogIndex>,
         last_log_term: Term,
     ) -> MessageResponse {
-        // If the candidate's term is less than ours or we already voted for another candidate, we don't vote for the candidate.
-        if term < self.persistent_state.current_term || self.persistent_state.voted_for.is_some() {
-            return MessageResponse::RequestVote {
-                term: self.persistent_state.current_term,
-                vote_granted: false,
-            };
-        }
-
-        let last_log_entry = self.persistent_state.log.last();
-        match last_log_entry {
-            Some(last_log_entry) => {
-                // We check if the candidate's log is at least as up to date as ours.
-                let candidate_log_newer = match last_log_index {
-                    Some(last_log_index) => last_log_index >= (self.persistent_state.log.len() - 1),
-                    None => true,
-                };
-
-                if last_log_term > last_log_entry.term
-                    || (last_log_term == last_log_entry.term && candidate_log_newer)
+        // Only a followe and a candidate can vote.
+        match self.role {
+            ServerRole::FOLLOWER | ServerRole::CANDIDATE => {
+                // If the candidate's term is less than ours or we already voted for another candidate, we don't vote for the candidate.
+                if term < self.persistent_state.current_term
+                    || self.persistent_state.voted_for.is_some()
                 {
-                    // We vote for the candidate.
-                    self.persistent_state.voted_for = Some(candidate_id);
-
                     return MessageResponse::RequestVote {
                         term: self.persistent_state.current_term,
-                        vote_granted: true,
+                        vote_granted: false,
                     };
                 }
-            }
-            None => {
-                // In case we have an empty log, the candidate will always be as up to date as us, thus we vote for it.
-                self.persistent_state.voted_for = Some(candidate_id);
 
-                return MessageResponse::RequestVote {
+                let last_log_entry = self.persistent_state.log.last();
+                match last_log_entry {
+                    Some(last_log_entry) => {
+                        // We check if the candidate's log is at least as up to date as ours.
+                        let candidate_log_newer = match last_log_index {
+                            Some(last_log_index) => {
+                                last_log_index >= (self.persistent_state.log.len() - 1)
+                            }
+                            None => true,
+                        };
+
+                        if last_log_term > last_log_entry.term
+                            || (last_log_term == last_log_entry.term && candidate_log_newer)
+                        {
+                            // We vote for the candidate.
+                            self.persistent_state.voted_for = Some(candidate_id);
+
+                            return MessageResponse::RequestVote {
+                                term: self.persistent_state.current_term,
+                                vote_granted: true,
+                            };
+                        }
+                    }
+                    None => {
+                        // In case we have an empty log, the candidate will always be as up to date as us, thus we vote for it.
+                        self.persistent_state.voted_for = Some(candidate_id);
+
+                        return MessageResponse::RequestVote {
+                            term: self.persistent_state.current_term,
+                            vote_granted: true,
+                        };
+                    }
+                }
+
+                MessageResponse::RequestVote {
                     term: self.persistent_state.current_term,
-                    vote_granted: true,
-                };
+                    vote_granted: false,
+                }
             }
+            _ => MessageResponse::Empty,
         }
-
-        return MessageResponse::RequestVote {
-            term: self.persistent_state.current_term,
-            vote_granted: false,
-        };
     }
 
-    pub fn handle_message_response(&mut self, sender_id: ServerId, message: MessageResponse) {
+    pub fn handle_append_entries_req(
+        &mut self,
+        term: Term,
+        leader_id: ServerId,
+        prev_log_index: Option<LogIndex>,
+        prev_log_term: Term,
+        entries: Log<LogEntry>,
+        leader_commit: LogIndex,
+    ) -> MessageResponse {
+        match self.role {
+            ServerRole::CANDIDATE => {
+                self.change_role(ServerRole::FOLLOWER);
+            }
+            ServerRole::FOLLOWER => {
+                self.clear_active_timers();
+                self.election_tid = Some(
+                    self.timers_manager
+                        .as_mut()
+                        .unwrap()
+                        .register(Duration::from_secs(2), TimerAction::SWITCH_TO_CANDIDATE),
+                );
+
+                // TODO: implement logic to apply the log entries.
+                return MessageResponse::AppendEntries {
+                    term: self.persistent_state.current_term,
+                    success: true,
+                };
+            }
+            _ => {}
+        }
+
+        MessageResponse::Empty
+    }
+
+    pub fn handle_message_response(
+        &mut self,
+        sender_id: ServerId,
+        // We want to also get access to the request that led to the response, in order to capture
+        // stateful behavior.
+        message_request: MessageRequest,
+        message_response: MessageResponse,
+    ) -> bool {
         println!(
             "Server {} received message response {:?} from {}",
-            self.id, message, sender_id
+            self.id, message_response, sender_id
         );
 
-        match message {
-            MessageResponse::AppendEntries { term, success } => todo!(),
+        match message_response {
+            MessageResponse::AppendEntries { term, success } => {
+                self.handle_append_entries_res(term, success, sender_id, message_request)
+            }
             MessageResponse::RequestVote { term, vote_granted } => {
                 self.handle_request_vote_res(term, vote_granted)
             }
-            MessageResponse::Empty => {}
+            MessageResponse::Empty => true,
         }
     }
 
-    fn handle_request_vote_res(&mut self, term: Term, vote_granted: bool) {
+    fn handle_request_vote_res(&mut self, _: Term, vote_granted: bool) -> bool {
         if vote_granted {
             self.persistent_state.voted_by =
                 Some(self.persistent_state.voted_by.map_or(0, |value| value) + 1);
@@ -376,9 +427,47 @@ impl RaftServer {
                     self.change_role(ServerRole::LEADER);
                 }
             }
-            // TODO: here we would need to send a message to all the other servers. We could implement a broadcaster component to simulate
-            // a transport layer.
         }
+
+        true
+    }
+
+    fn handle_append_entries_res(
+        &mut self,
+        _: Term,
+        success: bool,
+        sender_id: ServerId,
+        message_request: MessageRequest,
+    ) -> bool {
+        if let MessageRequest::AppendEntries {
+            term: _,
+            leader_id: _,
+            prev_log_index: _,
+            prev_log_term: _,
+            entries,
+            leader_commit: _,
+        } = message_request
+        {
+            if success && !entries.is_empty() {
+                let entries_len = entries.len();
+                *self
+                    .volatile_leader_state
+                    .as_mut()
+                    .unwrap()
+                    .next_index
+                    .get_mut(&sender_id)
+                    .unwrap() += entries_len;
+                *self
+                    .volatile_leader_state
+                    .as_mut()
+                    .unwrap()
+                    .match_index
+                    .get_mut(&sender_id)
+                    .unwrap() += (entries_len - 1);
+            }
+        }
+
+        success
     }
 
     pub fn change_role(&mut self, new_role: ServerRole) {
@@ -391,7 +480,7 @@ impl RaftServer {
         self.role = new_role;
     }
 
-    fn on_change_role(&mut self, prev_role: Option<ServerRole>, new_role: ServerRole) {
+    fn on_change_role(&mut self, _: Option<ServerRole>, new_role: ServerRole) {
         // When changing role, we want to clear timers that were active in the past, in order to avoid having problems with messages
         // being sent when they shouldn't.
         self.clear_active_timers();
@@ -400,7 +489,6 @@ impl RaftServer {
         match new_role {
             ServerRole::FOLLOWER => {
                 self.election_tid = Some(
-                    // TODO: check properly that the timers manager is not null.
                     self.timers_manager
                         .as_mut()
                         .unwrap()
@@ -429,7 +517,6 @@ impl RaftServer {
     }
 
     fn clear_active_timers(&mut self) {
-        // TODO: implement better system with an hashmap indexed by timer type.
         if let Some(tid) = self.election_tid {
             self.timers_manager.as_mut().unwrap().stop(tid);
             self.election_tid = None
