@@ -1,4 +1,4 @@
-use crate::core::{Log, LogIndex, RaftServer, ServerId, Term};
+use crate::core::{Log, LogEntry, LogIndex, RaftServer, ServerId, Term};
 
 pub trait Message {
     fn handle(handler: &mut RaftServer);
@@ -12,7 +12,7 @@ pub enum MessageRequest {
         leader_id: ServerId,
         prev_log_index: Option<LogIndex>,
         prev_log_term: Term,
-        entries: Log<u32>,
+        entries: Log<LogEntry>,
         leader_commit: LogIndex,
     },
     RequestVote {

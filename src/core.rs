@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     hash::Hash,
     mem,
     sync::{Arc, Mutex},
@@ -17,7 +18,7 @@ pub type Term = u32;
 pub type ServerId = u32;
 pub type Command = u32;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct LogEntry {
     term: Term,
     command: Command,
@@ -49,15 +50,23 @@ impl PersistentState {
     }
 
     pub fn prev_log_index(&self) -> Option<LogIndex> {
-        if self.log.len() > 1 {
-            return Some(self.log.len() - 2);
+        self.last_log_index().map(|value| value - 1)
+    }
+
+    pub fn prev_log_term(&self) -> Term {
+        self.current_term
+    }
+
+    pub fn last_log_index(&self) -> Option<LogIndex> {
+        if !self.log.is_empty() {
+            return Some(self.log.len() - 1);
         }
 
         None
     }
 
-    pub fn prev_log_term(&self) -> Term {
-        self.current_term
+    pub fn log_entries_from(&self, index: LogIndex) -> Vec<LogEntry> {
+        self.log.as_slice()[index..].to_vec()
     }
 }
 
@@ -76,8 +85,36 @@ impl VolatileState {
 }
 
 struct VolatileLeaderState {
-    next_index: Vec<LogIndex>,
-    match_index: Vec<LogIndex>,
+    next_index: HashMap<ServerId, LogIndex>,
+    match_index: HashMap<ServerId, LogIndex>,
+}
+
+impl VolatileLeaderState {
+    pub fn init(
+        last_log_index: Option<LogIndex>,
+        server_ids: Vec<ServerId>,
+    ) -> VolatileLeaderState {
+        let mut next_index = HashMap::new();
+        let mut match_index = HashMap::new();
+        let next_log_index = match last_log_index {
+            Some(last_log_index) => last_log_index + 1,
+            None => 0,
+        };
+
+        server_ids.iter().for_each(|&id| {
+            next_index.insert(id, next_log_index);
+            match_index.insert(id, 0);
+        });
+
+        VolatileLeaderState {
+            next_index,
+            match_index,
+        }
+    }
+
+    pub fn next_index(&self, server_id: ServerId) -> Option<LogIndex> {
+        self.next_index.get(&server_id).map(|value| *value)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -98,7 +135,7 @@ pub struct RaftServer {
     persistent_state: PersistentState,
     volatile_state: VolatileState,
     volatile_leader_state: Option<VolatileLeaderState>,
-    servers: u32,
+    server_ids: Vec<ServerId>,
     // Extra information.
     transport: Option<TransportInstance>,
     timers_manager: Option<TimersManager>,
@@ -115,7 +152,7 @@ impl RaftServer {
             persistent_state: PersistentState::default(),
             volatile_state: VolatileState::default(),
             volatile_leader_state: None,
-            servers: 0,
+            server_ids: vec![],
             transport: None,
             timers_manager: None,
             election_tid: None,
@@ -144,7 +181,11 @@ impl RaftServer {
         })
     }
 
-    pub fn prepare_message_request(&self, message_type: PrepareMessageType) -> MessageRequest {
+    pub fn prepare_message_request(
+        &self,
+        message_type: PrepareMessageType,
+        receiver_id: ServerId,
+    ) -> MessageRequest {
         match message_type {
             PrepareMessageType::EMPTY => MessageRequest::Empty,
             PrepareMessageType::EMPTY_APPEND_ENTRIES => MessageRequest::AppendEntries {
@@ -155,7 +196,33 @@ impl RaftServer {
                 entries: vec![],
                 leader_commit: self.volatile_state.commit_index,
             },
-            PrepareMessageType::APPEND_ENTRIES => todo!(),
+            PrepareMessageType::APPEND_ENTRIES => {
+                if let ServerRole::LEADER = self.role {
+                    let last_log_index = self.persistent_state.last_log_index();
+                    let next_index = self
+                        .volatile_leader_state
+                        .as_ref()
+                        .unwrap()
+                        .next_index(receiver_id);
+
+                    if let (Some(last_log_index), Some(next_index)) = (last_log_index, next_index) {
+                        // We want to check if we have to send new log entries to receiver.
+                        if last_log_index >= next_index {
+                            let entries = self.persistent_state.log_entries_from(next_index);
+                            return MessageRequest::AppendEntries {
+                                term: self.persistent_state.current_term,
+                                leader_id: self.id,
+                                prev_log_index: self.persistent_state.prev_log_index(),
+                                prev_log_term: self.persistent_state.prev_log_term(),
+                                entries,
+                                leader_commit: self.volatile_state.commit_index,
+                            };
+                        }
+                    }
+                }
+
+                MessageRequest::Empty
+            }
             PrepareMessageType::REQUEST_VOTE => MessageRequest::RequestVote {
                 term: self.persistent_state.current_term,
                 candidate_id: self.id,
@@ -194,7 +261,6 @@ impl RaftServer {
                 }
                 ServerRole::FOLLOWER => {
                     self.clear_active_timers();
-                    println!("RECREATING TIMER");
                     self.election_tid = Some(
                         self.timers_manager
                             .as_mut()
@@ -306,7 +372,7 @@ impl RaftServer {
 
             // In case we have received a role from the majority, including ourselves, we want to switch to leaders.
             if let Some(voted_by) = self.persistent_state.voted_by {
-                if voted_by > (self.servers / 2) as usize {
+                if voted_by > (self.server_ids.len() / 2) {
                     self.change_role(ServerRole::LEADER);
                 }
             }
@@ -352,7 +418,11 @@ impl RaftServer {
                 self.append_entires_tid = Some(self.timers_manager.as_mut().unwrap().register(
                     Duration::from_secs(1),
                     TimerAction::SEND_EMPTY_APPEND_ENTRIES,
-                ))
+                ));
+                self.volatile_leader_state = Some(VolatileLeaderState::init(
+                    self.persistent_state.last_log_index(),
+                    self.server_ids.iter().cloned().collect(),
+                ));
             }
             _ => {}
         }
@@ -371,8 +441,12 @@ impl RaftServer {
         }
     }
 
-    pub fn bind(&mut self, n: u32) {
-        self.servers += n
+    pub fn bind(&mut self, server_id: ServerId) {
+        self.server_ids.push(server_id);
+    }
+
+    pub fn bind_multiple(&mut self, server_ids: &mut Vec<ServerId>) {
+        self.server_ids.append(server_ids);
     }
 }
 

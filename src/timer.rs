@@ -44,7 +44,6 @@ impl TimersManager {
         let server = self.server.clone();
         let transport = self.transport.clone();
         // TODO: maybe we want to directly store the id, to avoid having to lock the server.
-
         let (tx, rx): (mpsc::Sender<()>, mpsc::Receiver<()>) = mpsc::channel();
         let handle = thread::spawn(move || loop {
             // We check if we were told to stop.

@@ -25,23 +25,24 @@ impl Transport {
     }
 
     pub fn add_server(&mut self, server: RaftServerInstance) {
-        self.propagate_membership_change();
-        server
-            .lock()
-            .unwrap()
-            .bind(self.servers.lock().unwrap().len() as u32);
-        self.servers
-            .lock()
-            .unwrap()
-            .insert(server.lock().unwrap().id, server.clone());
-    }
-
-    pub fn propagate_membership_change(&mut self) {
-        self.servers
+        let mut _server = server.lock().unwrap();
+        let mut server_ids: Vec<ServerId> = self
+            .servers
             .lock()
             .unwrap()
             .iter()
-            .for_each(|(_, server)| server.lock().unwrap().bind(1))
+            .map(|(&id, server)| {
+                // For each of the other servers we bind the new member.
+                server.lock().unwrap().bind(_server.id);
+                id
+            })
+            .collect();
+        // Once all the other servers are notified of the new member, we notify the new member the presence of the other members.
+        _server.bind_multiple(&mut server_ids);
+        self.servers
+            .lock()
+            .unwrap()
+            .insert(_server.id, server.clone());
     }
 
     pub fn broadcast(&mut self, sender_id: ServerId, message_type: PrepareMessageType) {
@@ -54,7 +55,7 @@ impl Transport {
                         let message_request = sender_server
                             .lock()
                             .unwrap()
-                            .prepare_message_request(message_type);
+                            .prepare_message_request(message_type, *receiver_id);
 
                         let message_response = receiver_server
                             .lock()
