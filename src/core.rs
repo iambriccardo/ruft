@@ -1,8 +1,7 @@
 use std::{
-    cmp::{self, min},
+    cmp::min,
     collections::HashMap,
     hash::Hash,
-    mem,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -121,7 +120,6 @@ impl VolatileLeaderState {
 #[derive(Clone, Copy)]
 pub enum PrepareMessageType {
     EMPTY,
-    EMPTY_APPEND_ENTRIES,
     APPEND_ENTRIES { decrement: usize },
     REQUEST_VOTE,
 }
@@ -202,14 +200,6 @@ impl RaftServer {
     ) -> MessageRequest {
         match message_type {
             PrepareMessageType::EMPTY => MessageRequest::Empty,
-            PrepareMessageType::EMPTY_APPEND_ENTRIES => MessageRequest::AppendEntries {
-                term: self.persistent_state.current_term,
-                leader_id: self.id,
-                prev_log_index: self.persistent_state.prev_log_index(),
-                prev_log_term: self.persistent_state.prev_log_term(),
-                entries: vec![],
-                leader_commit: self.volatile_state.commit_index,
-            },
             PrepareMessageType::APPEND_ENTRIES { decrement } => {
                 if let ServerRole::LEADER = self.role {
                     let last_log_index = self.persistent_state.last_log_index();
@@ -219,20 +209,23 @@ impl RaftServer {
                         .unwrap()
                         .next_index(receiver_id);
 
+                    // By default we want to send an empty array of entries.
+                    let mut entries = vec![];
                     if let (Some(last_log_index), Some(next_index)) = (last_log_index, next_index) {
                         // We want to check if we have to send new log entries to receiver.
                         if last_log_index >= next_index - decrement {
-                            let entries = self.persistent_state.log_entries_from(next_index);
-                            return MessageRequest::AppendEntries {
-                                term: self.persistent_state.current_term,
-                                leader_id: self.id,
-                                prev_log_index: self.persistent_state.prev_log_index(),
-                                prev_log_term: self.persistent_state.prev_log_term(),
-                                entries,
-                                leader_commit: self.volatile_state.commit_index,
-                            };
+                            entries = self.persistent_state.log_entries_from(next_index);
                         }
                     }
+
+                    return MessageRequest::AppendEntries {
+                        term: self.persistent_state.current_term,
+                        leader_id: self.id,
+                        prev_log_index: self.persistent_state.prev_log_index(),
+                        prev_log_term: self.persistent_state.prev_log_term(),
+                        entries,
+                        leader_commit: self.volatile_state.commit_index,
+                    };
                 }
 
                 MessageRequest::Empty
@@ -658,10 +651,12 @@ impl RaftServer {
                 .unwrap()
                 .broadcast(self.id, PrepareMessageType::REQUEST_VOTE),
             ServerRole::LEADER => {
-                self.append_entires_tid = Some(self.timers_manager.as_mut().unwrap().register(
-                    Duration::from_secs(1),
-                    TimerAction::SEND_EMPTY_APPEND_ENTRIES,
-                ));
+                self.append_entires_tid = Some(
+                    self.timers_manager
+                        .as_mut()
+                        .unwrap()
+                        .register(Duration::from_secs(1), TimerAction::SEND_APPEND_ENTRIES),
+                );
                 self.volatile_leader_state = Some(VolatileLeaderState::init(
                     self.persistent_state.last_log_index(),
                     self.server_ids.iter().cloned().collect(),

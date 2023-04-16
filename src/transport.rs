@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    rc::Rc,
     sync::{Arc, Mutex},
     thread,
 };

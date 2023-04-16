@@ -20,7 +20,7 @@ pub type TimerId = u32;
 #[derive(Debug, Clone, Copy)]
 pub enum TimerAction {
     SWITCH_TO_CANDIDATE,
-    SEND_EMPTY_APPEND_ENTRIES,
+    SEND_APPEND_ENTRIES,
 }
 
 pub struct TimersManager {
@@ -63,12 +63,14 @@ impl TimersManager {
                     .lock()
                     .unwrap()
                     .change_role(crate::core::ServerRole::CANDIDATE),
-                TimerAction::SEND_EMPTY_APPEND_ENTRIES => {
+                TimerAction::SEND_APPEND_ENTRIES => {
                     let server_id = server.lock().unwrap().id;
-                    transport
-                        .lock()
-                        .unwrap()
-                        .broadcast(server_id, PrepareMessageType::EMPTY_APPEND_ENTRIES)
+                    transport.lock().unwrap().broadcast(
+                        server_id,
+                        // We dispatch the message type with 0 decrement since this will tell the transport
+                        // layer that this is the first try that we will do for appending new entries.
+                        PrepareMessageType::APPEND_ENTRIES { decrement: 0 },
+                    )
                 }
             }
         });
