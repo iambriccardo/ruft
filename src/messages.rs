@@ -9,11 +9,13 @@ pub enum MessageRequest {
     Empty,
     AppendEntries {
         term: Term,
+        // Technically we don't need the leader_id for this implementation, but we will keep it here in case we decide
+        // to allow for leader discovery the servers directly and not a higher level transport layer.
         leader_id: ServerId,
         prev_log_index: Option<LogIndex>,
         prev_log_term: Term,
         entries: Log<LogEntry>,
-        leader_commit: LogIndex,
+        leader_commit: Option<LogIndex>,
     },
     RequestVote {
         term: Term,

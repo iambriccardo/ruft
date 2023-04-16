@@ -1,4 +1,5 @@
 use std::{
+    cmp::{self, min},
     collections::HashMap,
     hash::Hash,
     mem,
@@ -71,15 +72,15 @@ impl PersistentState {
 }
 
 struct VolatileState {
-    commit_index: LogIndex,
-    last_applied: LogIndex,
+    commit_index: Option<LogIndex>,
+    last_applied: Option<LogIndex>,
 }
 
 impl VolatileState {
     pub fn default() -> VolatileState {
         VolatileState {
-            commit_index: 0,
-            last_applied: 0,
+            commit_index: None,
+            last_applied: None,
         }
     }
 }
@@ -252,24 +253,25 @@ impl RaftServer {
     pub fn handle_message_request(
         &mut self,
         sender_id: ServerId,
-        message: MessageRequest,
+        message_request: MessageRequest,
     ) -> MessageResponse {
         println!(
             "Server {} received message request {:?} from {}",
-            self.id, message, sender_id
+            self.id, message_request, sender_id
         );
 
-        let response = match message {
+        self.check_if_incoming_req_term_is_greater(message_request.clone());
+
+        let response = match message_request {
             MessageRequest::AppendEntries {
                 term,
-                leader_id,
                 prev_log_index,
                 prev_log_term,
                 entries,
                 leader_commit,
+                ..
             } => self.handle_append_entries_req(
                 term,
-                leader_id,
                 prev_log_index,
                 prev_log_term,
                 entries,
@@ -284,13 +286,8 @@ impl RaftServer {
             _ => MessageResponse::Empty,
         };
 
-        if self.volatile_state.commit_index > self.volatile_state.last_applied {
-            self.volatile_state.last_applied += 1;
-            println!(
-                "Applying state {:?} to state machine",
-                self.persistent_state.log[self.volatile_state.last_applied]
-            );
-        }
+        self.try_advance_commit_index();
+        self.try_advance_state();
 
         response
     }
@@ -361,17 +358,18 @@ impl RaftServer {
     pub fn handle_append_entries_req(
         &mut self,
         term: Term,
-        leader_id: ServerId,
         prev_log_index: Option<LogIndex>,
         prev_log_term: Term,
         entries: Log<LogEntry>,
-        leader_commit: LogIndex,
+        leader_commit: Option<LogIndex>,
     ) -> MessageResponse {
         match self.role {
             ServerRole::CANDIDATE => {
                 self.change_role(ServerRole::FOLLOWER);
             }
             ServerRole::FOLLOWER => {
+                // Whenever we have an incoming append entries request, we have to reset the timer for switching to candididate,
+                // in order to allow the system to always have the same leader until faults occur.
                 self.clear_active_timers();
                 self.election_tid = Some(
                     self.timers_manager
@@ -379,6 +377,67 @@ impl RaftServer {
                         .unwrap()
                         .register(Duration::from_secs(2), TimerAction::SWITCH_TO_CANDIDATE),
                 );
+
+                if term < self.persistent_state.current_term {
+                    return MessageResponse::AppendEntries {
+                        term: self.persistent_state.current_term,
+                        success: false,
+                    };
+                }
+
+                // Only if there is a previous entry we want to check that the terms match.
+                if let Some(prev_log_index) = prev_log_index {
+                    if prev_log_index < self.persistent_state.log.len() {
+                        let log_entry = self.persistent_state.log[prev_log_index];
+                        if log_entry.term != prev_log_term {
+                            return MessageResponse::AppendEntries {
+                                term: self.persistent_state.current_term,
+                                success: false,
+                            };
+                        }
+                    } else {
+                        // In case the prev_log_index is out of bound, we also bail.
+                        return MessageResponse::AppendEntries {
+                            term: self.persistent_state.current_term,
+                            success: false,
+                        };
+                    }
+                }
+
+                // In case no prev_log_index is present, our append index will start from the first element of the array.
+                let mut append_index = prev_log_index.map_or(0, |value| value + 1);
+                let direct_access_max_index = self.persistent_state.log.len() - 1;
+                for entry in entries.into_iter() {
+                    if append_index <= direct_access_max_index {
+                        self.persistent_state.log[append_index] = entry;
+                    } else {
+                        self.persistent_state.log.push(entry);
+                    }
+                    append_index += 1;
+                }
+
+                let leader_commit = leader_commit.map_or(-1 as f32, |value| value as f32);
+                let local_commit = self
+                    .volatile_state
+                    .commit_index
+                    .map_or(-1 as f32, |value| value as f32);
+                // In case the leader has committed more entries, we want to advance ours too.
+                if leader_commit > local_commit {
+                    if let Some(last_log_index) = self.persistent_state.last_log_index() {
+                        // TODO: properly implement comparable type with total ordering between Option.
+                        if leader_commit == -1 as f32 {
+                            self.volatile_state.commit_index = Some(last_log_index);
+                        } else {
+                            self.volatile_state.commit_index =
+                                Some(min(leader_commit as usize, last_log_index));
+                        }
+                    } else {
+                        return MessageResponse::AppendEntries {
+                            term: self.persistent_state.current_term,
+                            success: false,
+                        };
+                    }
+                }
 
                 // TODO: implement logic to apply the log entries.
                 return MessageResponse::AppendEntries {
@@ -405,6 +464,8 @@ impl RaftServer {
             self.id, message_response, sender_id
         );
 
+        self.check_if_incoming_res_term_is_greater(message_response.clone());
+
         match message_response {
             MessageResponse::AppendEntries { term, success } => {
                 self.handle_append_entries_res(term, success, sender_id, message_request)
@@ -423,13 +484,20 @@ impl RaftServer {
 
             // In case we have received a role from the majority, including ourselves, we want to switch to leaders.
             if let Some(voted_by) = self.persistent_state.voted_by {
-                if voted_by > (self.server_ids.len() / 2) {
+                // Since we always vote for ourselves, we require the majority - 1.
+                if voted_by > (self.majority() - 1) {
                     self.change_role(ServerRole::LEADER);
                 }
             }
         }
 
         true
+    }
+
+    fn majority(&self) -> usize {
+        // The majority will always been half of the replicas to which we are connected + 1. This works under the assumption
+        // that server_ids contains an even number of elements that point to all the replicas.
+        (self.server_ids.len() / 2) + 1
     }
 
     fn handle_append_entries_res(
@@ -470,6 +538,76 @@ impl RaftServer {
         success
     }
 
+    fn check_if_incoming_req_term_is_greater(&mut self, message: MessageRequest) {
+        match message {
+            MessageRequest::AppendEntries { term, .. }
+            | MessageRequest::RequestVote { term, .. }
+                if term > self.persistent_state.current_term =>
+            {
+                self.change_role(ServerRole::FOLLOWER);
+            }
+            _ => {}
+        }
+    }
+
+    fn check_if_incoming_res_term_is_greater(&mut self, message: MessageResponse) {
+        match message {
+            MessageResponse::AppendEntries { term, .. }
+            | MessageResponse::RequestVote { term, .. }
+                if term > self.persistent_state.current_term =>
+            {
+                self.change_role(ServerRole::FOLLOWER)
+            }
+            _ => {}
+        }
+    }
+
+    fn try_advance_commit_index(&mut self) {
+        // We want to find an index N such that:
+        // N > self.volatile_state.commit_index
+        // A majority of self.volatile_leader_state.match_index >= N
+        // self.persistent_state.log[N].term == self.persistent_state.current_term
+
+        // It is importnat to note that this function is designed to be used incrementally and will not converge automatically
+        // to the highest commit index that satisfies the aforementioned conditions.
+
+        // The next most likely commit index is the next commit index.
+        let next_commit_index = self
+            .volatile_state
+            .commit_index
+            .map_or(0, |value| value + 1);
+
+        // We can run this logic only if we are a leader, which means we have a volatile leader state.
+        if next_commit_index < self.persistent_state.log.len() {
+            if let Some(volatile_leader_state) = self.volatile_leader_state.as_mut() {
+                let at_least_up_to_date = volatile_leader_state
+                    .match_index
+                    .iter()
+                    .filter(|(_, value)| **value >= next_commit_index)
+                    .count();
+
+                // We exclude ourselves from the count of the majority.
+                if at_least_up_to_date >= (self.majority() - 1)
+                    && self.persistent_state.log[next_commit_index].term
+                        == self.persistent_state.current_term
+                {
+                    self.volatile_state.commit_index = Some(next_commit_index);
+                }
+            }
+        }
+    }
+
+    fn try_advance_state(&mut self) {
+        // TODO: implement state advancement
+        // if self.volatile_state.commit_index > self.volatile_state.last_applied {
+        //     self.volatile_state.last_applied += 1;
+        //     println!(
+        //         "Applying state {:?} to state machine",
+        //         self.persistent_state.log[self.volatile_state.last_applied]
+        //     );
+        // }
+    }
+
     pub fn change_role(&mut self, new_role: ServerRole) {
         println!(
             "Changing role of server {:?} from {:?} to {:?}",
@@ -484,6 +622,10 @@ impl RaftServer {
         // When changing role, we want to clear timers that were active in the past, in order to avoid having problems with messages
         // being sent when they shouldn't.
         self.clear_active_timers();
+        // In case we have a leader state we want to delete it.
+        if self.volatile_leader_state.is_some() {
+            self.volatile_leader_state = None;
+        }
         // We must make sure that any call to transport or timers manager is non-blocking, otherwise we will deadlock, since those
         // services will want to get a lock on this instance of the server.
         match new_role {
