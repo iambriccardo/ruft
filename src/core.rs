@@ -406,10 +406,18 @@ impl RaftServer {
 
                 // In case no prev_log_index is present, our append index will start from the first element of the array.
                 let mut append_index = prev_log_index.map_or(0, |value| value + 1);
-                let direct_access_max_index = self.persistent_state.log.len() - 1;
+                let direct_access_max_index = if self.persistent_state.log.is_empty() {
+                    None
+                } else {
+                    Some(self.persistent_state.log.len() - 1)
+                };
                 for entry in entries.into_iter() {
-                    if append_index <= direct_access_max_index {
-                        self.persistent_state.log[append_index] = entry;
+                    if let Some(direct_access_max_index) = direct_access_max_index {
+                        if append_index <= direct_access_max_index {
+                            self.persistent_state.log[append_index] = entry;
+                        } else {
+                            self.persistent_state.log.push(entry);
+                        }
                     } else {
                         self.persistent_state.log.push(entry);
                     }
@@ -598,14 +606,19 @@ impl RaftServer {
     }
 
     fn try_advance_state(&mut self) {
-        // TODO: implement state advancement
-        // if self.volatile_state.commit_index > self.volatile_state.last_applied {
-        //     self.volatile_state.last_applied += 1;
-        //     println!(
-        //         "Applying state {:?} to state machine",
-        //         self.persistent_state.log[self.volatile_state.last_applied]
-        //     );
-        // }
+        let last_applied = self
+            .volatile_state
+            .last_applied
+            .map_or(-1 as f32, |value| value as f32);
+        if let Some(commit_index) = self.volatile_state.commit_index {
+            if commit_index as f32 > last_applied {
+                self.volatile_state.last_applied = Some((last_applied + 1 as f32) as usize);
+                println!(
+                    "Applying state {:?} to state machine",
+                    self.persistent_state.log[self.volatile_state.last_applied.unwrap()]
+                );
+            }
+        }
     }
 
     pub fn change_role(&mut self, new_role: ServerRole) {
