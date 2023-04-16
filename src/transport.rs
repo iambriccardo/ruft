@@ -4,18 +4,20 @@ use std::{
     thread,
 };
 
-use crate::core::{PrepareMessageType, RaftServer, RaftServerInstance, ServerId};
+use crate::core::{PrepareMessageType, RaftServerInstance, ServerId};
 
 pub type TransportInstance = Arc<Mutex<Transport>>;
 
 pub struct Transport {
     servers: Arc<Mutex<HashMap<ServerId, RaftServerInstance>>>,
+    leader_id: Option<ServerId>,
 }
 
 impl Transport {
     pub fn new() -> Transport {
         Transport {
             servers: Arc::new(Mutex::new(HashMap::new())),
+            leader_id: None,
         }
     }
 
@@ -42,6 +44,20 @@ impl Transport {
             .lock()
             .unwrap()
             .insert(_server.id, server.clone());
+    }
+
+    pub fn add_command(&self, command: u32) {
+        if let Some(leader_id) = self.leader_id {
+            if let Some(leader) = self.servers.lock().unwrap().get_mut(&leader_id) {
+                leader.lock().unwrap().add_command(command);
+            }
+        }
+
+        println!("No leader has been elected, thus the command can't be issued.");
+    }
+
+    pub fn notify_new_leader(&mut self, new_leader_id: ServerId) {
+        self.leader_id = Some(new_leader_id);
     }
 
     pub fn broadcast(&mut self, sender_id: ServerId, message_type: PrepareMessageType) {

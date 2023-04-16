@@ -50,7 +50,15 @@ impl PersistentState {
     }
 
     pub fn prev_log_index(&self) -> Option<LogIndex> {
-        self.last_log_index().map(|value| value - 1)
+        if let Some(last_log_index) = self.last_log_index() {
+            if last_log_index == 0 {
+                return None;
+            }
+
+            return Some(last_log_index - 1);
+        }
+
+        None
     }
 
     pub fn prev_log_term(&self) -> Term {
@@ -661,6 +669,12 @@ impl RaftServer {
                     self.persistent_state.last_log_index(),
                     self.server_ids.iter().cloned().collect(),
                 ));
+                self.transport
+                    .as_mut()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .notify_new_leader(self.id);
             }
             _ => {}
         }

@@ -1,18 +1,14 @@
 use std::{
-    borrow::Borrow,
     collections::HashMap,
     mem,
-    sync::{
-        mpsc::{self, Sender},
-        Arc, Mutex,
-    },
+    sync::mpsc::{self, Sender},
     thread::{self, JoinHandle},
     time::Duration,
 };
 
 use crate::{
-    core::{PrepareMessageType, RaftServerInstance, ServerId},
-    transport::{Transport, TransportInstance},
+    core::{PrepareMessageType, RaftServerInstance},
+    transport::TransportInstance,
 };
 
 pub type TimerId = u32;
