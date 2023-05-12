@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Display,
     mem,
     sync::{
         mpsc::{self, Sender},
@@ -24,7 +25,7 @@ pub enum TimerAction {
 
 pub struct TimersManager<T, E>
 where
-    T: Send + Sync + ClientState<E> + Clone + 'static,
+    T: Display + Send + Sync + ClientState<E> + Clone + 'static,
     E: Send + Sync + 'static,
 {
     server: Arc<Mutex<RaftServer<T, E>>>,
@@ -35,7 +36,7 @@ where
 
 impl<T, E> TimersManager<T, E>
 where
-    T: Send + Sync + ClientState<E> + Clone + 'static,
+    T: Display + Send + Sync + ClientState<E> + Clone + 'static,
     E: Send + Sync + 'static,
 {
     pub fn new(

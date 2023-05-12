@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Display,
     sync::{Arc, Mutex},
     thread,
 };
@@ -8,7 +9,7 @@ use crate::core::{ClientState, PrepareMessageType, RaftServer, ServerId};
 
 pub struct Transport<T, E>
 where
-    T: Send + Sync + ClientState<E> + Clone + 'static,
+    T: Display + Send + Sync + ClientState<E> + Clone + 'static,
     E: Send + Sync + 'static,
 {
     servers: Arc<Mutex<HashMap<ServerId, Arc<Mutex<RaftServer<T, E>>>>>>,
@@ -17,7 +18,7 @@ where
 
 impl<T, E> Transport<T, E>
 where
-    T: Send + Sync + ClientState<E> + Clone + 'static,
+    T: Display + Send + Sync + ClientState<E> + Clone + 'static,
     E: Send + Sync + 'static,
 {
     pub fn new() -> Transport<T, E> {

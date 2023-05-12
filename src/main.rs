@@ -1,9 +1,11 @@
 use crate::core::{ClientState, RaftClient};
 use std::{
+    fmt::Display,
     thread::{self, sleep},
     time::Duration,
 };
 
+use rand::Rng;
 use timer::TimersManager;
 use transport::Transport;
 
@@ -14,9 +16,15 @@ pub mod messages;
 pub mod timer;
 pub mod transport;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ReplicatedList {
     list: Vec<u32>,
+}
+
+impl Display for ReplicatedList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.list)
+    }
 }
 
 impl ClientState<Vec<u32>> for ReplicatedList {
@@ -57,7 +65,10 @@ fn main() {
     });
 
     loop {
-        transport.lock().unwrap().add_command(1);
+        let mut rng = rand::thread_rng();
+        let number: u32 = rng.gen_range(1..=100);
+        transport.lock().unwrap().add_command(number);
         sleep(Duration::from_secs(5));
+        client.inspect_state();
     }
 }

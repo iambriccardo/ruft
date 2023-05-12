@@ -1,6 +1,7 @@
 use std::{
     cmp::min,
     collections::HashMap,
+    fmt::Display,
     hash::Hash,
     marker::PhantomData,
     sync::{Arc, Mutex},
@@ -17,6 +18,7 @@ pub type Log<T> = Vec<T>;
 pub type LogIndex = usize;
 pub type Term = u32;
 pub type ServerId = u32;
+// For now we don't use command as a generic type but in the future it will be needed.
 pub type Command = u32;
 
 #[derive(Debug, Clone, Copy)]
@@ -150,7 +152,7 @@ impl PrepareMessageType {
 
 pub struct RaftServer<T, E>
 where
-    T: Send + Sync + ClientState<E> + Clone + 'static,
+    T: Display + Send + Sync + ClientState<E> + Clone + 'static,
     E: Send + Sync + 'static,
 {
     // Basic base information.
@@ -172,7 +174,7 @@ where
 
 impl<T, E> RaftServer<T, E>
 where
-    T: Send + Sync + ClientState<E> + Clone + 'static,
+    T: Display + Send + Sync + ClientState<E> + Clone + 'static,
     E: Send + Sync + 'static,
 {
     pub fn new(id: ServerId) -> RaftServer<T, E> {
@@ -271,10 +273,10 @@ where
         sender_id: ServerId,
         message_request: MessageRequest,
     ) -> MessageResponse {
-        println!(
-            "Server {} received message request {:?} from {}",
-            self.id, message_request, sender_id
-        );
+        // println!(
+        //     "Server {} received message request {:?} from {}",
+        //     self.id, message_request, sender_id
+        // );
 
         self.check_if_incoming_req_term_is_greater(message_request.clone());
 
@@ -480,10 +482,10 @@ where
         message_request: MessageRequest,
         message_response: MessageResponse,
     ) -> bool {
-        println!(
-            "Server {} received message response {:?} from {}",
-            self.id, message_response, sender_id
-        );
+        // println!(
+        //     "Server {} received message response {:?} from {}",
+        //     self.id, message_response, sender_id
+        // );
 
         self.check_if_incoming_res_term_is_greater(message_response.clone());
 
@@ -649,10 +651,16 @@ where
         if let Some(commit_index) = self.volatile_state.commit_index {
             if commit_index as f32 > last_applied {
                 self.volatile_state.last_applied = Some((last_applied + 1 as f32) as usize);
-                println!(
-                    "Applying state {:?} to state machine",
-                    self.persistent_state.log[self.volatile_state.last_applied.unwrap()]
-                );
+                let applied_log_entry =
+                    self.persistent_state.log[self.volatile_state.last_applied.unwrap()];
+                println!("Applying state {:?} to state machine", applied_log_entry);
+                // In case there is some shared state, we want to apply the newly added log entry.
+                if let Some(shared_state) = self.shared_state.as_ref() {
+                    shared_state
+                        .lock()
+                        .unwrap()
+                        .apply_command(applied_log_entry.command);
+                }
             }
         }
     }
@@ -738,14 +746,14 @@ where
 
 impl<T, E> Eq for RaftServer<T, E>
 where
-    T: Send + Sync + ClientState<E> + Clone + 'static,
+    T: Display + Send + Sync + ClientState<E> + Clone + 'static,
     E: Send + Sync + 'static,
 {
 }
 
 impl<T, E> PartialEq for RaftServer<T, E>
 where
-    T: Send + Sync + ClientState<E> + Clone + 'static,
+    T: Display + Send + Sync + ClientState<E> + Clone + 'static,
     E: Send + Sync + 'static,
 {
     fn eq(&self, other: &Self) -> bool {
@@ -755,7 +763,7 @@ where
 
 impl<T, E> Hash for RaftServer<T, E>
 where
-    T: Send + Sync + ClientState<E> + Clone + 'static,
+    T: Display + Send + Sync + ClientState<E> + Clone + 'static,
     E: Send + Sync + 'static,
 {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -774,7 +782,7 @@ pub trait ClientState<T> {
 // TODO: implement a Raft client which sends commands to the leader, either by discovery or just by always knowing who is the leader.
 pub struct RaftClient<T, E>
 where
-    T: Send + Sync + ClientState<E> + Clone + 'static,
+    T: Display + Send + Sync + ClientState<E> + Clone + 'static,
     E: Send + Sync + 'static,
 {
     transport: Arc<Mutex<Transport<T, E>>>,
@@ -784,7 +792,7 @@ where
 
 impl<T, E> RaftClient<T, E>
 where
-    T: Send + Sync + ClientState<E> + Clone + 'static,
+    T: Display + Send + Sync + ClientState<E> + Clone + 'static,
     E: Send + Sync + 'static,
 {
     pub fn new(transport: Arc<Mutex<Transport<T, E>>>, shared_state: T) -> RaftClient<T, E> {
@@ -793,5 +801,16 @@ where
             shared_state: Arc::new(Mutex::new(shared_state.clone())),
             _1: PhantomData,
         }
+    }
+
+    pub fn add_command(&self, command: Command) {
+        self.transport.lock().unwrap().add_command(command);
+    }
+
+    pub fn inspect_state(&self) {
+        println!(
+            "The state of the client is {}",
+            self.shared_state.lock().unwrap()
+        )
     }
 }
