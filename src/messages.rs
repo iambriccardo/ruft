@@ -1,8 +1,4 @@
-use crate::core::{Log, LogEntry, LogIndex, RaftServer, ServerId, Term};
-
-pub trait Message {
-    fn handle(handler: &mut RaftServer);
-}
+use crate::core::{Log, LogEntry, LogIndex, ServerId, Term};
 
 #[derive(Debug, Clone)]
 pub enum MessageRequest {
@@ -31,6 +27,3 @@ pub enum MessageResponse {
     AppendEntries { term: Term, success: bool },
     RequestVote { term: Term, vote_granted: bool },
 }
-
-#[cfg(test)]
-mod tests {}

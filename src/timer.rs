@@ -1,14 +1,17 @@
 use std::{
     collections::HashMap,
     mem,
-    sync::mpsc::{self, Sender},
+    sync::{
+        mpsc::{self, Sender},
+        Arc, Mutex,
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
 
 use crate::{
-    core::{PrepareMessageType, RaftServerInstance},
-    transport::TransportInstance,
+    core::{ClientState, PrepareMessageType, RaftServer},
+    transport::Transport,
 };
 
 pub type TimerId = u32;
@@ -19,15 +22,26 @@ pub enum TimerAction {
     SEND_APPEND_ENTRIES,
 }
 
-pub struct TimersManager {
-    server: RaftServerInstance,
-    transport: TransportInstance,
+pub struct TimersManager<T, E>
+where
+    T: Send + Sync + ClientState<E> + Clone + 'static,
+    E: Send + Sync + 'static,
+{
+    server: Arc<Mutex<RaftServer<T, E>>>,
+    transport: Arc<Mutex<Transport<T, E>>>,
     active_timers: HashMap<TimerId, (JoinHandle<()>, Sender<()>)>,
     next_id: TimerId,
 }
 
-impl TimersManager {
-    pub fn new(server: RaftServerInstance, transport: TransportInstance) -> TimersManager {
+impl<T, E> TimersManager<T, E>
+where
+    T: Send + Sync + ClientState<E> + Clone + 'static,
+    E: Send + Sync + 'static,
+{
+    pub fn new(
+        server: Arc<Mutex<RaftServer<T, E>>>,
+        transport: Arc<Mutex<Transport<T, E>>>,
+    ) -> TimersManager<T, E> {
         TimersManager {
             server,
             transport,
@@ -47,6 +61,7 @@ impl TimersManager {
                 break;
             }
 
+            // We sleep for the given duration.
             thread::sleep(sleep);
 
             // We check if we were told to stop.
@@ -59,15 +74,12 @@ impl TimersManager {
                     .lock()
                     .unwrap()
                     .change_role(crate::core::ServerRole::CANDIDATE),
-                TimerAction::SEND_APPEND_ENTRIES => {
-                    let server_id = server.lock().unwrap().id;
-                    transport.lock().unwrap().broadcast(
-                        server_id,
-                        // We dispatch the message type with 0 decrement since this will tell the transport
-                        // layer that this is the first try that we will do for appending new entries.
-                        PrepareMessageType::APPEND_ENTRIES { decrement: 0 },
-                    )
-                }
+                TimerAction::SEND_APPEND_ENTRIES => transport.lock().unwrap().broadcast(
+                    server.lock().unwrap().id,
+                    // We dispatch the message type with 0 decrement since this will tell the transport
+                    // layer that this is the first try that we will do for appending new entries.
+                    PrepareMessageType::APPEND_ENTRIES { decrement: 0 },
+                ),
             }
         });
 

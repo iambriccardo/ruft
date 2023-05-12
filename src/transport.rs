@@ -4,28 +4,34 @@ use std::{
     thread,
 };
 
-use crate::core::{PrepareMessageType, RaftServerInstance, ServerId};
+use crate::core::{ClientState, PrepareMessageType, RaftServer, ServerId};
 
-pub type TransportInstance = Arc<Mutex<Transport>>;
-
-pub struct Transport {
-    servers: Arc<Mutex<HashMap<ServerId, RaftServerInstance>>>,
+pub struct Transport<T, E>
+where
+    T: Send + Sync + ClientState<E> + Clone + 'static,
+    E: Send + Sync + 'static,
+{
+    servers: Arc<Mutex<HashMap<ServerId, Arc<Mutex<RaftServer<T, E>>>>>>,
     leader_id: Option<ServerId>,
 }
 
-impl Transport {
-    pub fn new() -> Transport {
+impl<T, E> Transport<T, E>
+where
+    T: Send + Sync + ClientState<E> + Clone + 'static,
+    E: Send + Sync + 'static,
+{
+    pub fn new() -> Transport<T, E> {
         Transport {
             servers: Arc::new(Mutex::new(HashMap::new())),
             leader_id: None,
         }
     }
 
-    pub fn new_instance() -> TransportInstance {
+    pub fn new_instance() -> Arc<Mutex<Transport<T, E>>> {
         Arc::new(Mutex::new(Self::new()))
     }
 
-    pub fn add_server(&mut self, server: RaftServerInstance) {
+    pub fn add_server(&mut self, server: Arc<Mutex<RaftServer<T, E>>>) {
         let mut _server = server.lock().unwrap();
         let mut server_ids: Vec<ServerId> = self
             .servers
@@ -50,10 +56,12 @@ impl Transport {
         if let Some(leader_id) = self.leader_id {
             if let Some(leader) = self.servers.lock().unwrap().get_mut(&leader_id) {
                 leader.lock().unwrap().add_command(command);
+            } else {
+                println!("No leader has been elected, thus the command can't be issued.");
             }
+        } else {
+            println!("No leader has been elected, thus the command can't be issued.");
         }
-
-        println!("No leader has been elected, thus the command can't be issued.");
     }
 
     pub fn notify_new_leader(&mut self, new_leader_id: ServerId) {

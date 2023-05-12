@@ -2,6 +2,7 @@ use std::{
     cmp::min,
     collections::HashMap,
     hash::Hash,
+    marker::PhantomData,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -9,7 +10,7 @@ use std::{
 use crate::{
     messages::{MessageRequest, MessageResponse},
     timer::{TimerAction, TimerId, TimersManager},
-    transport::TransportInstance,
+    transport::Transport,
 };
 
 pub type Log<T> = Vec<T>;
@@ -136,6 +137,8 @@ impl PrepareMessageType {
     pub fn retry(&self) -> Self {
         match self {
             PrepareMessageType::APPEND_ENTRIES { decrement } => {
+                // In case we retrying the append entries message, we want to decrement the next_index by 1 in order to
+                // try to find a index such that the prev_index and prev_term invariants hold.
                 PrepareMessageType::APPEND_ENTRIES {
                     decrement: decrement + 1,
                 }
@@ -145,9 +148,11 @@ impl PrepareMessageType {
     }
 }
 
-pub type RaftServerInstance = Arc<Mutex<RaftServer>>;
-
-pub struct RaftServer {
+pub struct RaftServer<T, E>
+where
+    T: Send + Sync + ClientState<E> + Clone + 'static,
+    E: Send + Sync + 'static,
+{
     // Basic base information.
     pub id: ServerId,
     pub role: ServerRole,
@@ -157,14 +162,20 @@ pub struct RaftServer {
     volatile_leader_state: Option<VolatileLeaderState>,
     server_ids: Vec<ServerId>,
     // Extra information.
-    transport: Option<TransportInstance>,
-    timers_manager: Option<TimersManager>,
+    transport: Option<Arc<Mutex<Transport<T, E>>>>,
+    timers_manager: Option<TimersManager<T, E>>,
     election_tid: Option<TimerId>,
     append_entires_tid: Option<TimerId>,
+    shared_state: Option<Arc<Mutex<T>>>,
+    _1: PhantomData<E>,
 }
 
-impl RaftServer {
-    pub fn new(id: ServerId) -> RaftServer {
+impl<T, E> RaftServer<T, E>
+where
+    T: Send + Sync + ClientState<E> + Clone + 'static,
+    E: Send + Sync + 'static,
+{
+    pub fn new(id: ServerId) -> RaftServer<T, E> {
         RaftServer {
             id,
             // By default the server has no role assigned.
@@ -177,20 +188,24 @@ impl RaftServer {
             timers_manager: None,
             election_tid: None,
             append_entires_tid: None,
+            shared_state: None,
+            _1: PhantomData,
         }
     }
 
-    pub fn new_instance(id: ServerId) -> RaftServerInstance {
+    pub fn new_instance(id: ServerId) -> Arc<Mutex<RaftServer<T, E>>> {
         Arc::new(Mutex::new(Self::new(id)))
     }
 
     pub fn register_dependencies(
         &mut self,
-        transport: TransportInstance,
-        timers_manager: TimersManager,
+        transport: Arc<Mutex<Transport<T, E>>>,
+        timers_manager: TimersManager<T, E>,
+        shared_state: Arc<Mutex<T>>,
     ) {
         self.transport = Some(transport);
         self.timers_manager = Some(timers_manager);
+        self.shared_state = Some(shared_state);
     }
 
     pub fn add_command(&mut self, command: Command) {
@@ -286,9 +301,6 @@ impl RaftServer {
             } => self.handle_request_vote_req(term, candidate_id, last_log_index, last_log_term),
             _ => MessageResponse::Empty,
         };
-
-        self.try_advance_commit_index();
-        self.try_advance_state();
 
         response
     }
@@ -475,7 +487,7 @@ impl RaftServer {
 
         self.check_if_incoming_res_term_is_greater(message_response.clone());
 
-        match message_response {
+        let success = match message_response {
             MessageResponse::AppendEntries { term, success } => {
                 self.handle_append_entries_res(term, success, sender_id, message_request)
             }
@@ -483,7 +495,15 @@ impl RaftServer {
                 self.handle_request_vote_res(term, vote_granted)
             }
             MessageResponse::Empty => true,
+        };
+
+        // If we are the leader, after a response we want to advance the commit index and possibly the state.
+        if let ServerRole::LEADER = self.role {
+            self.try_advance_commit_index();
+            self.try_advance_state();
         }
+
+        success
     }
 
     fn handle_request_vote_res(&mut self, _: Term, vote_granted: bool) -> bool {
@@ -501,12 +521,6 @@ impl RaftServer {
         }
 
         true
-    }
-
-    fn majority(&self) -> usize {
-        // The majority will always been half of the replicas to which we are connected + 1. This works under the assumption
-        // that server_ids contains an even number of elements that point to all the replicas.
-        (self.server_ids.len() / 2) + 1
     }
 
     fn handle_append_entries_res(
@@ -534,17 +548,36 @@ impl RaftServer {
                     .next_index
                     .get_mut(&sender_id)
                     .unwrap() += entries_len;
+                // The match index is always next_index - 1.
                 *self
                     .volatile_leader_state
                     .as_mut()
                     .unwrap()
                     .match_index
                     .get_mut(&sender_id)
-                    .unwrap() += (entries_len - 1);
+                    .unwrap() = *self
+                    .volatile_leader_state
+                    .as_mut()
+                    .unwrap()
+                    .next_index
+                    .get_mut(&sender_id)
+                    .unwrap()
+                    - 1;
+
+                println!(
+                    "Entries#{:?} applied successfully on replica {:?}, updating volatile leader state.",
+                    entries_len, sender_id
+                );
             }
         }
 
         success
+    }
+
+    fn majority(&self) -> usize {
+        // The majority will always been half of the replicas to which we are connected + 1. This works under the assumption
+        // that server_ids contains an even number of elements that point to all the replicas.
+        (self.server_ids.len() / 2) + 1
     }
 
     fn check_if_incoming_req_term_is_greater(&mut self, message: MessageRequest) {
@@ -589,6 +622,7 @@ impl RaftServer {
         // We can run this logic only if we are a leader, which means we have a volatile leader state.
         if next_commit_index < self.persistent_state.log.len() {
             if let Some(volatile_leader_state) = self.volatile_leader_state.as_mut() {
+                // TODO: find problem in this function for why the commit index is not updated.
                 let at_least_up_to_date = volatile_leader_state
                     .match_index
                     .iter()
@@ -611,6 +645,7 @@ impl RaftServer {
             .volatile_state
             .last_applied
             .map_or(-1 as f32, |value| value as f32);
+
         if let Some(commit_index) = self.volatile_state.commit_index {
             if commit_index as f32 > last_applied {
                 self.volatile_state.last_applied = Some((last_applied + 1 as f32) as usize);
@@ -701,22 +736,62 @@ impl RaftServer {
     }
 }
 
-impl Eq for RaftServer {}
+impl<T, E> Eq for RaftServer<T, E>
+where
+    T: Send + Sync + ClientState<E> + Clone + 'static,
+    E: Send + Sync + 'static,
+{
+}
 
-impl PartialEq for RaftServer {
+impl<T, E> PartialEq for RaftServer<T, E>
+where
+    T: Send + Sync + ClientState<E> + Clone + 'static,
+    E: Send + Sync + 'static,
+{
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
     }
 }
 
-impl Hash for RaftServer {
+impl<T, E> Hash for RaftServer<T, E>
+where
+    T: Send + Sync + ClientState<E> + Clone + 'static,
+    E: Send + Sync + 'static,
+{
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.id.hash(state)
     }
 }
 
-// TODO: implement a Raft client which sends commands to the leader, either by discovery or just by always knowing who is the leader.
-struct RaftClient {}
+pub trait ClientState<T> {
+    fn init() -> Self;
 
-#[cfg(test)]
-mod tests {}
+    fn apply_command(&mut self, command: Command);
+
+    fn get_state(&self) -> T;
+}
+
+// TODO: implement a Raft client which sends commands to the leader, either by discovery or just by always knowing who is the leader.
+pub struct RaftClient<T, E>
+where
+    T: Send + Sync + ClientState<E> + Clone + 'static,
+    E: Send + Sync + 'static,
+{
+    transport: Arc<Mutex<Transport<T, E>>>,
+    pub shared_state: Arc<Mutex<T>>,
+    _1: PhantomData<E>,
+}
+
+impl<T, E> RaftClient<T, E>
+where
+    T: Send + Sync + ClientState<E> + Clone + 'static,
+    E: Send + Sync + 'static,
+{
+    pub fn new(transport: Arc<Mutex<Transport<T, E>>>, shared_state: T) -> RaftClient<T, E> {
+        RaftClient {
+            transport,
+            shared_state: Arc::new(Mutex::new(shared_state.clone())),
+            _1: PhantomData,
+        }
+    }
+}
