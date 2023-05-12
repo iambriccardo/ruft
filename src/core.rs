@@ -273,10 +273,10 @@ where
         sender_id: ServerId,
         message_request: MessageRequest,
     ) -> MessageResponse {
-        // println!(
-        //     "Server {} received message request {:?} from {}",
-        //     self.id, message_request, sender_id
-        // );
+        println!(
+            "Server {} received message request {:?} from {}",
+            self.id, message_request, sender_id
+        );
 
         self.check_if_incoming_req_term_is_greater(message_request.clone());
 
@@ -482,10 +482,10 @@ where
         message_request: MessageRequest,
         message_response: MessageResponse,
     ) -> bool {
-        // println!(
-        //     "Server {} received message response {:?} from {}",
-        //     self.id, message_response, sender_id
-        // );
+        println!(
+            "Server {} received message response {:?} from {}",
+            self.id, message_response, sender_id
+        );
 
         self.check_if_incoming_res_term_is_greater(message_response.clone());
 
